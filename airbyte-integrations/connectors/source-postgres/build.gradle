@@ -28,11 +28,16 @@ dependencies {
     api "com.google.protobuf:protobuf-java:3.25.5" // for fixing vulnerability of protobuf-java used by Debezium
     implementation 'commons-codec:commons-codec:1.16.0'
     implementation 'io.debezium:debezium-embedded:3.0.1.Final'
-    implementation 'io.debezium:debezium-connector-postgres:3.0.1.Final'
+    implementation 'io.debezium:debezium-connector-postgres:3.0.1.Final' // Includes TimescaleDB SMT support
 
     testFixturesApi 'org.testcontainers:postgresql:1.19.0'
 
     testImplementation 'org.hamcrest:hamcrest-all:1.3'
+}
+
+// SpotBugs configuration to exclude generated code warnings
+spotbugs {
+    excludeFilter = file('spotbugs-exclude.xml')
 }
 
 jsonSchema2Pojo {

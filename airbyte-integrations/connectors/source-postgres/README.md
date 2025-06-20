@@ -1,5 +1,24 @@
 # Postgres Source
 
+## TimescaleDB Support
+
+This connector now supports TimescaleDB for enhanced time-series data processing. When TimescaleDB support is enabled:
+
+- The `_timescaledb_internal` schema is included in data discovery and synchronization
+- TimescaleDB Single Message Transform (SMT) is applied to enrich messages with metadata
+- Logical TimescaleDB structures (hypertables, continuous aggregates) are properly mapped to their physical storage
+- Messages include headers with TimescaleDB-specific information for proper routing and processing
+
+To enable TimescaleDB support:
+1. Ensure TimescaleDB extension is installed in your PostgreSQL database
+2. Set `timescaledb_support` to `true` in the connector configuration
+3. Use CDC (Change Data Capture) replication method for optimal TimescaleDB integration
+
+### TimescaleDB Features Supported
+- **Hypertables**: Automatic routing of physical chunk data to logical hypertable topics
+- **Continuous Aggregates**: Processing of materialized view data with proper metadata enrichment  
+- **Compression**: Handling of compressed chunks (typically filtered out in processing pipelines)
+
 ## Performance Test
 
 To run performance tests in commandline:

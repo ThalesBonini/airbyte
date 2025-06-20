@@ -195,6 +195,50 @@ public class PostgresUtils {
     return streamList.stream().map(s -> "%s.%s".formatted(s.getStream().getNamespace(), s.getStream().getName())).collect(Collectors.joining(", "));
   }
 
+  /**
+   * Checks if TimescaleDB extension is installed in the database.
+   * @param database the JDBC database connection
+   * @return true if TimescaleDB extension is available, false otherwise
+   */
+  public static boolean isTimescaleDbAvailable(final JdbcDatabase database) {
+    try {
+      final var result = database.queryStrings(
+          connection -> connection.createStatement().executeQuery("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'"),
+          rs -> rs.getString(1));
+      final boolean available = !result.isEmpty();
+      LOGGER.info("TimescaleDB extension availability: {}", available);
+      return available;
+    } catch (Exception e) {
+      LOGGER.warn("Failed to check TimescaleDB extension availability: {}", e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * Checks if TimescaleDB support should be enabled based on configuration and database availability.
+   * @param config the source configuration
+   * @param database the JDBC database connection
+   * @return true if TimescaleDB support should be enabled
+   */
+  public static boolean shouldEnableTimescaleDbSupport(final JsonNode config, final JdbcDatabase database) {
+    if (config == null || !config.has("timescaledb_support")) {
+      return false;
+    }
+    
+    final boolean configEnabled = config.get("timescaledb_support").asBoolean();
+    if (!configEnabled) {
+      return false;
+    }
+    
+    // Check if TimescaleDB is actually available in the database
+    final boolean available = isTimescaleDbAvailable(database);
+    if (!available) {
+      LOGGER.warn("TimescaleDB support is enabled in configuration but TimescaleDB extension is not available in the database");
+    }
+    
+    return available;
+  }
+
   public static void advanceLsn(final JdbcDatabase database) {
     try {
       if (database.getMetaData().getDatabaseMajorVersion() < POSTGRESQL_VERSION_15) {

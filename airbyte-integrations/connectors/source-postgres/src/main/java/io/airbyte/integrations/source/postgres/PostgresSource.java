@@ -4,6 +4,7 @@
 
 package io.airbyte.integrations.source.postgres;
 
+import static io.airbyte.cdk.db.jdbc.JdbcConstants.INTERNAL_SCHEMA_NAME;
 import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_COLUMN_COLUMN_NAME;
 import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_INDEX_NAME;
 import static io.airbyte.cdk.db.jdbc.JdbcConstants.JDBC_INDEX_NON_UNIQUE;
@@ -124,6 +125,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -277,6 +279,8 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
   public Set<String> getExcludedInternalNameSpaces() {
     return Set.of("information_schema", "pg_catalog", "pg_internal", "catalog_history");
   }
+  
+
 
   @Override
   protected Set<String> getExcludedViews() {
@@ -687,7 +691,8 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
 
   @Override
   protected boolean isNotInternalSchema(final JsonNode jsonNode, final Set<String> internalSchemas) {
-    return false;
+    final String schemaName = jsonNode.get(INTERNAL_SCHEMA_NAME).asText();
+    return !internalSchemas.contains(schemaName);
   }
 
   @Override

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+    <!-- Exclude RC_REF_COMPARISON warnings for auto-generated model classes -->
+    <Match>
+        <Bug pattern="RC_REF_COMPARISON"/>
+        <Class name="io.airbyte.integrations.source.postgres.internal.models.CtidStatus"/>
+    </Match>
+    <Match>
+        <Bug pattern="RC_REF_COMPARISON"/>
+        <Class name="io.airbyte.integrations.source.postgres.internal.models.XminStatus"/>
+    </Match>
+    <Match>
+        <Bug pattern="RC_REF_COMPARISON"/>
+        <Class name="io.airbyte.integrations.source.postgres.internal.models.CursorBasedStatus"/>
+    </Match>
+</FindBugsFilter> 

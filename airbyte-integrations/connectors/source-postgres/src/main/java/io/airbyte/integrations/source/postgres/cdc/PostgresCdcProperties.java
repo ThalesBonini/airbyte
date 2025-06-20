@@ -48,6 +48,26 @@ public class PostgresCdcProperties {
 
     props.setProperty("publication.autocreate.mode", "disabled");
 
+    // TimescaleDB configuration
+    if (sourceConfig.has("timescaledb_support") && sourceConfig.get("timescaledb_support").asBoolean()) {
+      LOGGER.info("TimescaleDB support enabled, configuring TimescaleDB SMT");
+      LOGGER.info("Source config keys: {}", sourceConfig.fieldNames());
+      configureTimescaleDbProperties(props, database);
+      LOGGER.info("TimescaleDB configuration completed. Final properties contain {} entries", props.size());
+      // Log key TimescaleDB properties for debugging
+      if (props.containsKey("schema.include.list")) {
+        LOGGER.info("schema.include.list: {}", props.getProperty("schema.include.list"));
+      }
+      if (props.containsKey("transforms")) {
+        LOGGER.info("transforms: {}", props.getProperty("transforms"));
+      }
+      // Log all properties for debugging
+      LOGGER.info("All Debezium properties:");
+      props.forEach((key, value) -> LOGGER.info("  {}: {}", key, value));
+    } else {
+      LOGGER.info("TimescaleDB support is disabled or not configured");
+    }
+
     return props;
   }
 
@@ -113,6 +133,58 @@ public class PostgresCdcProperties {
     final Properties props = commonProperties(database);
     props.setProperty("snapshot.mode", "initial_only");
     return props;
+  }
+
+  /**
+   * Configures TimescaleDB-specific properties for Debezium connector.
+   * Based on the TimescaleDB SMT documentation, this includes:
+   * - Including ONLY the _timescaledb_internal schema to capture chunk events
+   * - Configuring the TimescaleDB transform to route chunk events to logical hypertable topics
+   * - Setting up database connection details for the SMT
+   */
+  private static void configureTimescaleDbProperties(final Properties props, final JdbcDatabase database) {
+    final JsonNode sourceConfig = database.getSourceConfig();
+    final JsonNode dbConfig = database.getDatabaseConfig();
+    
+    // For TimescaleDB, we ONLY include the _timescaledb_internal schema
+    // The TimescaleDB SMT will capture chunk events and route them to logical hypertable topics
+    // This prevents conflicts between hypertable and chunk events
+    props.setProperty("schema.include.list", "_timescaledb_internal");
+    
+    LOGGER.info("TimescaleDB mode: Only including _timescaledb_internal schema for chunk capture");
+    
+    // Configure TimescaleDB transform
+    props.setProperty("transforms", "timescaledb");
+    props.setProperty("transforms.timescaledb.type", "io.debezium.connector.postgresql.transforms.timescaledb.TimescaleDb");
+    
+    // Configure database connection details for the SMT using source config
+    // (the original config before JDBC transformation)
+    if (sourceConfig.has(JdbcUtils.HOST_KEY) && sourceConfig.get(JdbcUtils.HOST_KEY) != null) {
+      props.setProperty("transforms.timescaledb.database.hostname", sourceConfig.get(JdbcUtils.HOST_KEY).asText());
+    }
+    
+    if (sourceConfig.has(JdbcUtils.PORT_KEY) && sourceConfig.get(JdbcUtils.PORT_KEY) != null) {
+      props.setProperty("transforms.timescaledb.database.port", sourceConfig.get(JdbcUtils.PORT_KEY).asText());
+    }
+    
+    if (sourceConfig.has(JdbcUtils.USERNAME_KEY) && sourceConfig.get(JdbcUtils.USERNAME_KEY) != null) {
+      props.setProperty("transforms.timescaledb.database.user", sourceConfig.get(JdbcUtils.USERNAME_KEY).asText());
+    }
+    
+    if (sourceConfig.has(JdbcUtils.PASSWORD_KEY) && sourceConfig.get(JdbcUtils.PASSWORD_KEY) != null) {
+      props.setProperty("transforms.timescaledb.database.password", sourceConfig.get(JdbcUtils.PASSWORD_KEY).asText());
+    }
+    
+    if (sourceConfig.has(JdbcUtils.DATABASE_KEY) && sourceConfig.get(JdbcUtils.DATABASE_KEY) != null) {
+      props.setProperty("transforms.timescaledb.database.dbname", sourceConfig.get(JdbcUtils.DATABASE_KEY).asText());
+    }
+    
+    // Enable additional debugging for TimescaleDB SMT
+    LOGGER.info("TimescaleDB SMT configured with:");
+    LOGGER.info("  schema.include.list: _timescaledb_internal");
+    LOGGER.info("  transforms: timescaledb");
+    LOGGER.info("  TimescaleDB SMT will capture chunk events and route to logical hypertable topics");
+    LOGGER.info("  Hypertable events will appear on topics like: {}.public.metrics", props.getProperty("database.server.name", "server"));
   }
 
 }

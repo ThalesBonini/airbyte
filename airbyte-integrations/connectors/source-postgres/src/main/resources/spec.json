@@ -221,6 +221,14 @@
           }
         ]
       },
+      "timescaledb_support": {
+        "title": "TimescaleDB Support",
+        "description": "Enable TimescaleDB support for time-series data processing with enhanced metadata and routing.",
+        "type": "boolean",
+        "default": false,
+        "order": 8,
+        "group": "advanced"
+      },
       "replication_method": {
         "type": "object",
         "title": "Update Method",
