@@ -137,21 +137,26 @@ public class PostgresCdcProperties {
 
   /**
    * Configures TimescaleDB-specific properties for Debezium connector.
-   * Based on the TimescaleDB SMT documentation, this includes:
-   * - Including ONLY the _timescaledb_internal schema to capture chunk events
+   * Based on the TimescaleDB SMT documentation and real-world testing, this includes:
+   * - Including BOTH _timescaledb_internal schema (for chunk events) AND schemas containing hypertables
    * - Configuring the TimescaleDB transform to route chunk events to logical hypertable topics
    * - Setting up database connection details for the SMT
+   * 
+   * CRITICAL: The SMT routes events FROM _timescaledb_internal._hyper_X_Y_chunk TO logical hypertables
+   * in other schemas. Therefore, we must include BOTH schemas in the catalog to avoid 
+   * "Missing catalog stream" errors.
    */
   private static void configureTimescaleDbProperties(final Properties props, final JdbcDatabase database) {
     final JsonNode sourceConfig = database.getSourceConfig();
     final JsonNode dbConfig = database.getDatabaseConfig();
     
-    // For TimescaleDB, we ONLY include the _timescaledb_internal schema
-    // The TimescaleDB SMT will capture chunk events and route them to logical hypertable topics
-    // This prevents conflicts between hypertable and chunk events
-    props.setProperty("schema.include.list", "_timescaledb_internal");
+    // For TimescaleDB, we need to include:
+    // 1. _timescaledb_internal schema (physical chunk tables)
+    // 2. Schemas containing hypertables (logical tables that SMT routes to)
+    String schemaIncludeList = getTimescaleDbSchemaIncludeList(database);
+    props.setProperty("schema.include.list", schemaIncludeList);
     
-    LOGGER.info("TimescaleDB mode: Only including _timescaledb_internal schema for chunk capture");
+    LOGGER.info("TimescaleDB mode: Including schemas for both chunks and hypertables: {}", schemaIncludeList);
     
     // Configure TimescaleDB transform
     props.setProperty("transforms", "timescaledb");
@@ -185,6 +190,52 @@ public class PostgresCdcProperties {
     LOGGER.info("  transforms: timescaledb");
     LOGGER.info("  TimescaleDB SMT will capture chunk events and route to logical hypertable topics");
     LOGGER.info("  Hypertable events will appear on topics like: {}.public.metrics", props.getProperty("database.server.name", "server"));
+  }
+
+  /**
+   * Determines the schema include list for TimescaleDB configurations.
+   * 
+   * This method queries the database to find all schemas that contain hypertables,
+   * then creates an include list that contains both:
+   * 1. _timescaledb_internal (for physical chunk tables)
+   * 2. All schemas containing hypertables (for logical tables that SMT routes to)
+   * 
+   * This prevents "Missing catalog stream" errors when the TimescaleDB SMT routes
+   * events from chunk tables to hypertable topics.
+   */
+  private static String getTimescaleDbSchemaIncludeList(final JdbcDatabase database) {
+    try {
+      // Query to find all schemas containing hypertables
+      final String hypertableSchemaQuery = """
+          SELECT DISTINCT h.schema_name 
+          FROM _timescaledb_catalog.hypertable h
+          WHERE h.schema_name IS NOT NULL
+          ORDER BY h.schema_name
+          """;
+      
+      final var hypertableSchemas = database.queryJsons(hypertableSchemaQuery);
+      
+      // Start with _timescaledb_internal (always required for chunks)
+      StringBuilder schemaList = new StringBuilder("_timescaledb_internal");
+      
+      // Add schemas containing hypertables
+      for (var schema : hypertableSchemas) {
+        String schemaName = schema.get("schema_name").asText();
+        if (!schemaName.equals("_timescaledb_internal")) {
+          schemaList.append(",").append(schemaName);
+        }
+      }
+      
+      String result = schemaList.toString();
+      LOGGER.info("TimescaleDB hypertable schema discovery found schemas: {}", result);
+      
+      return result;
+      
+    } catch (Exception e) {
+      LOGGER.warn("Failed to discover TimescaleDB hypertable schemas, falling back to _timescaledb_internal only: {}", e.getMessage());
+      // Fallback to original behavior if schema discovery fails
+      return "_timescaledb_internal";
+    }
   }
 
 }

@@ -85,13 +85,16 @@ public class PostgresCdcCtidInitializer {
         catalog,
         state,
         database.getSourceConfig());
+    
+    // Use the TimescaleDB-aware LSN comparison method
     return postgresDebeziumStateUtil.isSavedOffsetAfterReplicationSlotLSN(
         // We can assume that there will be only 1 replication slot cause before the sync starts for
         // Postgres CDC,
         // we run all the check operations and one of the check validates that the replication slot exists
         // and has only 1 entry
         replicationSlot,
-        savedOffset);
+        savedOffset,
+        database.getSourceConfig());
   }
 
   public static CtidGlobalStateManager getCtidInitialLoadGlobalStateManager(final JdbcDatabase database,
@@ -179,8 +182,10 @@ public class PostgresCdcCtidInitializer {
 
     if (!savedOffsetAfterReplicationSlotLSN) {
       AirbyteTraceMessageUtility.emitAnalyticsTrace(cdcCursorInvalidMessage());
+      
       if (!sourceConfig.get("replication_method").has(INVALID_CDC_CURSOR_POSITION_PROPERTY) || sourceConfig.get("replication_method").get(
           INVALID_CDC_CURSOR_POSITION_PROPERTY).asText().equals(FAIL_SYNC_OPTION)) {
+        
         throw new ConfigErrorException(
             "Saved offset is before replication slot's confirmed lsn. Please reset the connection, and then increase WAL retention and/or increase sync frequency to prevent this from happening in the future. See https://docs.airbyte.com/integrations/sources/postgres/postgres-troubleshooting#under-cdc-incremental-mode-there-are-still-full-refresh-syncs for more details.");
       } else if (sourceConfig.get("replication_method").get(INVALID_CDC_CURSOR_POSITION_PROPERTY).asText().equals(RESYNC_DATA_OPTION)) {

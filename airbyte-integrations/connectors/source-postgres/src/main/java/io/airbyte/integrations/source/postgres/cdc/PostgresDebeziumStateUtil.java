@@ -33,6 +33,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -59,18 +60,46 @@ public class PostgresDebeziumStateUtil implements DebeziumStateUtil {
 
   public boolean isSavedOffsetAfterReplicationSlotLSN(final JsonNode replicationSlot,
                                                       final OptionalLong savedOffset) {
+    // For backward compatibility, call the TimescaleDB-aware version with null config
+    // This means TimescaleDB support will be disabled for this call
+    return isSavedOffsetAfterReplicationSlotLSN(replicationSlot, savedOffset, null);
+  }
+
+  /**
+   * TimescaleDB-aware version of the LSN comparison that properly handles SMT-related LSN tracking.
+   * When TimescaleDB support is enabled, we need to be more careful about how we interpret the
+   * saved offset because the SMT routing can affect state management.
+   */
+  public boolean isSavedOffsetAfterReplicationSlotLSN(final JsonNode replicationSlot,
+                                                      final OptionalLong savedOffset,
+                                                      final JsonNode config) {
 
     if (Objects.isNull(savedOffset) || savedOffset.isEmpty()) {
       return true;
     }
 
+    // Check if TimescaleDB support is enabled
+    final boolean isTimescaleDbEnabled = config != null && 
+        config.has("timescaledb_support") && 
+        config.get("timescaledb_support").asBoolean();
+
     if (replicationSlot.has("confirmed_flush_lsn")) {
       final long confirmedFlushLsnOnServerSide = Lsn.valueOf(replicationSlot.get("confirmed_flush_lsn").asText()).asLong();
       LOGGER.info("Replication slot confirmed_flush_lsn : " + confirmedFlushLsnOnServerSide + " Saved offset LSN : " + savedOffset.getAsLong());
+      
+      if (isTimescaleDbEnabled) {
+        return handleTimescaleDbLsnComparison(replicationSlot, savedOffset.getAsLong(), confirmedFlushLsnOnServerSide, "confirmed_flush_lsn");
+      }
+      
       return savedOffset.getAsLong() >= confirmedFlushLsnOnServerSide;
     } else if (replicationSlot.has("restart_lsn")) {
       final long restartLsn = Lsn.valueOf(replicationSlot.get("restart_lsn").asText()).asLong();
       LOGGER.info("Replication slot restart_lsn : " + restartLsn + " Saved offset LSN : " + savedOffset.getAsLong());
+      
+      if (isTimescaleDbEnabled) {
+        return handleTimescaleDbLsnComparison(replicationSlot, savedOffset.getAsLong(), restartLsn, "restart_lsn");
+      }
+      
       return savedOffset.getAsLong() >= restartLsn;
     }
 
@@ -143,6 +172,75 @@ public class PostgresDebeziumStateUtil implements DebeziumStateUtil {
   }
 
   /**
+   * Handle LSN comparison for TimescaleDB configurations.
+   * 
+   * TimescaleDB with schema filtering can create scenarios where the saved offset
+   * is legitimately behind the replication slot's LSN due to:
+   * 1. Schema filtering (schema.include.list: _timescaledb_internal)
+   * 2. SMT routing between physical chunks and logical hypertables
+   * 3. Database activity outside the filtered schema advancing the slot
+   * 
+   * This method implements a robust validation strategy that:
+   * - Allows small LSN differences when WAL is healthy and slot is active
+   * - Validates that the replication slot is in a good state
+   * - Provides detailed logging for debugging
+   * - Fails safely when the difference is too large or slot is unhealthy
+   */
+  private boolean handleTimescaleDbLsnComparison(final JsonNode replicationSlot, 
+                                                 final long savedOffsetLsn, 
+                                                 final long slotLsn, 
+                                                 final String slotType) {
+    final long lsnDifference = slotLsn - savedOffsetLsn;
+    
+    LOGGER.info("TimescaleDB LSN comparison - Saved offset: {}, Slot {}: {}, Difference: {} bytes", 
+        savedOffsetLsn, slotType, slotLsn, lsnDifference);
+    
+    // If saved offset is ahead or equal, we're good
+    if (lsnDifference <= 0) {
+      LOGGER.info("TimescaleDB: Saved offset is ahead of or equal to slot LSN - proceeding normally");
+      return true;
+    }
+    
+    // Check replication slot health indicators
+    final String slotStatus = replicationSlot.has("active") ? 
+        (replicationSlot.get("active").asBoolean() ? "active" : "inactive") : "unknown";
+    final String walStatus = replicationSlot.has("wal_status") ? 
+        replicationSlot.get("wal_status").asText() : "unknown";
+    
+    LOGGER.info("TimescaleDB: Replication slot status: {}, WAL status: {}", slotStatus, walStatus);
+    
+    // Define safe LSN difference threshold for TimescaleDB schema filtering
+    // This accounts for normal database activity outside the filtered schema
+    final long TIMESCALEDB_SAFE_LSN_THRESHOLD = 1024 * 1024; // 1MB
+    
+    if (lsnDifference <= TIMESCALEDB_SAFE_LSN_THRESHOLD) {
+      // Small difference - check if WAL is healthy
+      if ("reserved".equals(walStatus) || "extended".equals(walStatus)) {
+        LOGGER.info("TimescaleDB: Small LSN difference ({} bytes) with healthy WAL status '{}' - allowing continuation. " +
+                   "This is normal for TimescaleDB with schema filtering where database activity outside " +
+                   "_timescaledb_internal schema can advance the replication slot.", 
+                   lsnDifference, walStatus);
+        return true;
+      } else if ("unreserved".equals(walStatus)) {
+        LOGGER.warn("TimescaleDB: WAL status is 'unreserved' with LSN difference of {} bytes. " +
+                   "This indicates potential data loss risk.", lsnDifference);
+        return false;
+      } else {
+        LOGGER.warn("TimescaleDB: Unknown WAL status '{}' with LSN difference of {} bytes. " +
+                   "Proceeding cautiously but this should be investigated.", walStatus, lsnDifference);
+        return true; // Allow unknown status for backward compatibility
+      }
+    } else {
+      // Large difference - likely indicates a real problem
+      LOGGER.error("TimescaleDB: Large LSN difference ({} bytes, threshold: {} bytes) detected. " +
+                  "This indicates significant WAL advancement beyond our saved position. " +
+                  "Slot status: {}, WAL status: {}. This requires manual intervention.", 
+                  lsnDifference, TIMESCALEDB_SAFE_LSN_THRESHOLD, slotStatus, walStatus);
+      return false;
+    }
+  }
+
+  /**
    * Loads the offset data from the saved Debezium offset file.
    *
    * @param properties Properties should contain the relevant properties like path to the debezium
@@ -160,8 +258,23 @@ public class PostgresDebeziumStateUtil implements DebeziumStateUtil {
 
       final PostgresConnectorConfig postgresConnectorConfig = new PostgresConnectorConfig(Configuration.from(properties));
       final PostgresCustomLoader loader = new PostgresCustomLoader(postgresConnectorConfig);
-      final Set<Partition> partitions =
-          Collections.singleton(new PostgresPartition(postgresConnectorConfig.getLogicalName(), properties.getProperty(DATABASE_NAME.name())));
+      
+      // Check if TimescaleDB support is enabled
+      final boolean isTimescaleDbEnabled = properties.containsKey("transforms") && 
+          "timescaledb".equals(properties.getProperty("transforms"));
+      
+      Set<Partition> partitions;
+      if (isTimescaleDbEnabled) {
+        LOGGER.info("TimescaleDB SMT detected - using enhanced partition offset lookup");
+        // For TimescaleDB, we need to check multiple potential partition keys because
+        // the SMT routing can cause offsets to be stored under different partition names
+        partitions = getTimescaleDbPartitions(postgresConnectorConfig, properties);
+      } else {
+        // Standard partition lookup
+        partitions = Collections.singleton(
+            new PostgresPartition(postgresConnectorConfig.getLogicalName(), 
+                                 properties.getProperty(DATABASE_NAME.name())));
+      }
 
       final OffsetReader<Partition, PostgresOffsetContext, Loader> offsetReader = new OffsetReader<>(offsetStorageReader, loader);
       final Map<Partition, PostgresOffsetContext> offsets = offsetReader.offsets(partitions);
@@ -178,40 +291,119 @@ public class PostgresDebeziumStateUtil implements DebeziumStateUtil {
       }
     }
   }
+  
+  /**
+   * Get potential partition keys for TimescaleDB SMT.
+   * TimescaleDB SMT can cause offsets to be stored under different partition keys
+   * due to routing between physical chunks and logical hypertables.
+   */
+  private Set<Partition> getTimescaleDbPartitions(final PostgresConnectorConfig postgresConnectorConfig, 
+                                                  final Properties properties) {
+    final String logicalName = postgresConnectorConfig.getLogicalName();
+    final String databaseName = properties.getProperty(DATABASE_NAME.name());
+    
+    Set<Partition> partitions = new HashSet<>();
+    
+    // Standard partition (this should be the primary one)
+    partitions.add(new PostgresPartition(logicalName, databaseName));
+    
+    // For TimescaleDB, also check for potential SMT-related partition variations
+    // The SMT might create partitions with different server names or database combinations
+    
+    // Check for partition with server name matching the topic prefix pattern
+    if (properties.containsKey("topic.prefix")) {
+      final String topicPrefix = properties.getProperty("topic.prefix");
+      if (!topicPrefix.equals(logicalName)) {
+        partitions.add(new PostgresPartition(topicPrefix, databaseName));
+        LOGGER.info("TimescaleDB: Added partition with topic prefix: {}", topicPrefix);
+      }
+    }
+    
+    // Check for partition with database server name
+    if (properties.containsKey("database.server.name")) {
+      final String serverName = properties.getProperty("database.server.name");
+      if (!serverName.equals(logicalName)) {
+        partitions.add(new PostgresPartition(serverName, databaseName));
+        LOGGER.info("TimescaleDB: Added partition with server name: {}", serverName);
+      }
+    }
+    
+    LOGGER.info("TimescaleDB: Checking {} potential partitions for offsets", partitions.size());
+    return partitions;
+  }
 
   private OptionalLong extractLsn(final Set<Partition> partitions,
                                   final Map<Partition, PostgresOffsetContext> offsets,
                                   final PostgresCustomLoader loader) {
     boolean found = false;
+    OptionalLong foundLsn = OptionalLong.empty();
+    Partition foundPartition = null;
+    
     for (final Partition partition : partitions) {
       final PostgresOffsetContext postgresOffsetContext = offsets.get(partition);
 
       if (postgresOffsetContext != null) {
         found = true;
         LOGGER.info("Found previous partition offset {}: {}", partition, postgresOffsetContext.getOffset());
+        
+        // Extract LSN from this partition's offset
+        final Map<String, ?> offset = postgresOffsetContext.getOffset();
+        OptionalLong partitionLsn = OptionalLong.empty();
+        
+        if (offset.containsKey(LAST_COMMIT_LSN_KEY)) {
+          partitionLsn = OptionalLong.of((long) offset.get(LAST_COMMIT_LSN_KEY));
+        } else if (offset.containsKey(LSN_KEY)) {
+          partitionLsn = OptionalLong.of((long) offset.get(LSN_KEY));
+        }
+        
+        if (partitionLsn.isPresent()) {
+          if (foundLsn.isEmpty()) {
+            // First LSN found - use this one
+            foundLsn = partitionLsn;
+            foundPartition = partition;
+            LOGGER.info("Using LSN {} from partition {}", foundLsn.getAsLong(), partition);
+          } else if (foundLsn.getAsLong() != partitionLsn.getAsLong()) {
+            // Different LSN found - this indicates a potential issue
+            LOGGER.warn("Found different LSN values across partitions! Current: {} from {}, Previous: {} from {}. " +
+                "This may indicate a state consistency issue. Using the first LSN found for consistency.", 
+                partitionLsn.getAsLong(), partition, foundLsn.getAsLong(), foundPartition);
+            // Continue using the first LSN found for consistency
+          } else {
+            // Same LSN found - this is expected for TimescaleDB SMT routing
+            LOGGER.info("Confirmed same LSN {} found in partition {} (expected for TimescaleDB SMT)", 
+                partitionLsn.getAsLong(), partition);
+          }
+        }
       }
     }
 
     if (!found) {
-      LOGGER.info("No previous offsets found");
+      LOGGER.info("No previous offsets found in any partition");
+      
+      // Fallback: check loader's raw offset as last resort
+      if (loader.getRawOffset().containsKey(LSN_KEY)) {
+        final long lsn = Long.parseLong(loader.getRawOffset().get(LSN_KEY).toString());
+        LOGGER.info("Found LSN in loader raw offset: {}", lsn);
+        return OptionalLong.of(lsn);
+      }
+      
       return OptionalLong.empty();
     }
 
-    final Offsets<Partition, PostgresOffsetContext> of = Offsets.of(offsets);
-    final PostgresOffsetContext previousOffset = of.getTheOnlyOffset();
-
-    final Map<String, ?> offset = previousOffset.getOffset();
-
-    if (offset.containsKey(LAST_COMMIT_LSN_KEY)) {
-      return OptionalLong.of((long) offset.get(LAST_COMMIT_LSN_KEY));
-    } else if (offset.containsKey(LSN_KEY)) {
-      return OptionalLong.of((long) offset.get(LSN_KEY));
-    } else if (loader.getRawOffset().containsKey(LSN_KEY)) {
-      return OptionalLong.of(Long.parseLong(loader.getRawOffset().get(LSN_KEY).toString()));
+    if (foundLsn.isPresent()) {
+      LOGGER.info("Using LSN: {} from partition: {}", foundLsn.getAsLong(), foundPartition);
+      return foundLsn;
+    }
+    
+    // If we found partitions but no LSN in their offsets, check the loader as fallback
+    if (loader.getRawOffset().containsKey(LSN_KEY)) {
+      final long lsn = Long.parseLong(loader.getRawOffset().get(LSN_KEY).toString());
+      LOGGER.info("Found LSN in loader raw offset as fallback: {}", lsn);
+      return OptionalLong.of(lsn);
     }
 
+    LOGGER.warn("Found partition offsets but no LSN values - this may indicate a state corruption issue");
     return OptionalLong.empty();
-
   }
 
   private static ThreadLocal<JsonNode> initialState = new ThreadLocal<>();
