@@ -71,6 +71,45 @@ public class PostgresUtils {
     return isCdc;
   }
 
+  /**
+   * Checks if TimescaleDB support is enabled in the configuration.
+   */
+  public static boolean isTimescaleDbEnabled(final JsonNode config) {
+    return config.has("timescaledb_support") && config.get("timescaledb_support").asBoolean();
+  }
+
+  /**
+   * Checks if a stream should be processed using TimescaleDB-specific logic.
+   */
+  public static boolean shouldUseTimescaleDbProcessing(final JsonNode config, final ConfiguredAirbyteStream stream) {
+    return isTimescaleDbEnabled(config) && isLikelyTimescaleDbStream(stream);
+  }
+
+  /**
+   * Heuristic to determine if a stream is likely a TimescaleDB hypertable.
+   * This is used as a fallback when direct hypertable detection is not available.
+   */
+  private static boolean isLikelyTimescaleDbStream(final ConfiguredAirbyteStream stream) {
+    // Check for common TimescaleDB naming patterns
+    final String tableName = stream.getStream().getName().toLowerCase();
+    final String namespace = stream.getStream().getNamespace();
+    
+    // Skip internal TimescaleDB schemas
+    if ("_timescaledb_internal".equals(namespace) || 
+        "_timescaledb_catalog".equals(namespace) ||
+        "_timescaledb_config".equals(namespace)) {
+      return false;
+    }
+    
+    // Common time-series table patterns
+    return tableName.contains("metric") || 
+           tableName.contains("sensor") || 
+           tableName.contains("event") || 
+           tableName.contains("log") || 
+           tableName.contains("time") ||
+           tableName.contains("measurement");
+  }
+
   public static boolean shouldFlushAfterSync(final JsonNode config) {
     final boolean shouldFlushAfterSync = config.hasNonNull("replication_method")
         && config.get("replication_method").hasNonNull("lsn_commit_behaviour")

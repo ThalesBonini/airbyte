@@ -314,7 +314,18 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
   @Override
   @Trace(operationName = DISCOVER_TRACE_OPERATION_NAME)
   public AirbyteCatalog discover(final JsonNode config) {
-    final AirbyteCatalog catalog = super.discover(config);
+    AirbyteCatalog catalog = super.discover(config);
+
+    // Enhance catalog with TimescaleDB metadata if enabled
+    if (isTimescaleDbEnabled(config)) {
+      try {
+        final JdbcDatabase database = createDatabase(config);
+        catalog = io.airbyte.integrations.source.postgres.timescaledb.TimescaleDbDiscoveryHandler.enhanceCatalog(catalog, database);
+        LOGGER.info("Enhanced catalog with TimescaleDB metadata for {} streams", catalog.getStreams().size());
+      } catch (final Exception e) {
+        LOGGER.warn("Failed to enhance catalog with TimescaleDB metadata, continuing with standard discovery", e);
+      }
+    }
 
     if (isCdc(config)) {
       final List<AirbyteStream> streams = catalog.getStreams().stream()
@@ -1030,6 +1041,13 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
 
   private boolean cloudDeploymentMode() {
     return AdaptiveSourceRunner.CLOUD_MODE.equalsIgnoreCase(getFeatureFlags().deploymentMode());
+  }
+
+  /**
+   * Checks if TimescaleDB support is enabled in the configuration.
+   */
+  private boolean isTimescaleDbEnabled(final JsonNode config) {
+    return config.has("timescaledb_support") && config.get("timescaledb_support").asBoolean();
   }
 
 }

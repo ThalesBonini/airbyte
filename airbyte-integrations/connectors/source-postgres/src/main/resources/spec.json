@@ -229,6 +229,54 @@
         "order": 8,
         "group": "advanced"
       },
+      "timescaledb_chunk_discovery_interval_minutes": {
+        "title": "Chunk Discovery Interval (minutes)",
+        "description": "How often to refresh TimescaleDB chunk information. Lower values provide more up-to-date chunk data but increase database load.",
+        "type": "integer",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 60,
+        "order": 8.1,
+        "group": "advanced"
+      },
+      "timescaledb_max_concurrent_chunks": {
+        "title": "Max Concurrent Chunks",
+        "description": "Maximum number of TimescaleDB chunks to process simultaneously. Higher values can improve performance but increase memory usage.",
+        "type": "integer",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 10,
+        "order": 8.2,
+        "group": "advanced"
+      },
+      "timescaledb_enable_chunk_caching": {
+        "title": "Enable Chunk Caching",
+        "description": "Cache TimescaleDB chunk metadata to reduce database queries. Recommended for better performance.",
+        "type": "boolean",
+        "default": true,
+        "order": 8.3,
+        "group": "advanced"
+      },
+      "timescaledb_chunk_cache_ttl_minutes": {
+        "title": "Chunk Cache TTL (minutes)",
+        "description": "How long to cache TimescaleDB chunk metadata before refreshing from the database.",
+        "type": "integer",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 120,
+        "order": 8.4,
+        "group": "advanced"
+      },
+      "timescaledb_max_memory_mb": {
+        "title": "Max Memory Usage (MB)",
+        "description": "Maximum memory usage for TimescaleDB chunk processing. Helps prevent out-of-memory errors with large chunks.",
+        "type": "integer",
+        "default": 512,
+        "minimum": 100,
+        "maximum": 4096,
+        "order": 8.5,
+        "group": "advanced"
+      },
       "replication_method": {
         "type": "object",
         "title": "Update Method",
