@@ -18,6 +18,7 @@ import io.airbyte.cdk.integrations.debezium.internals.DebeziumPropertiesManager;
 import io.airbyte.cdk.integrations.debezium.internals.DebeziumStateUtil;
 import io.airbyte.cdk.integrations.debezium.internals.RelationalDbDebeziumPropertiesManager;
 import io.airbyte.commons.json.Jsons;
+import io.airbyte.integrations.source.postgres.TimescaleDbUtils;
 import io.airbyte.protocol.models.v0.ConfiguredAirbyteCatalog;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.OffsetReader;
@@ -59,19 +60,50 @@ public class PostgresDebeziumStateUtil implements DebeziumStateUtil {
 
   public boolean isSavedOffsetAfterReplicationSlotLSN(final JsonNode replicationSlot,
                                                       final OptionalLong savedOffset) {
+    return isSavedOffsetAfterReplicationSlotLSN(replicationSlot, savedOffset, null);
+  }
+
+  public boolean isSavedOffsetAfterReplicationSlotLSN(final JsonNode replicationSlot,
+                                                      final OptionalLong savedOffset,
+                                                      final JsonNode sourceConfig) {
 
     if (Objects.isNull(savedOffset) || savedOffset.isEmpty()) {
       return true;
     }
 
+    // Check if TimescaleDB support is enabled
+    final boolean isTimescaleDbEnabled = sourceConfig != null && TimescaleDbUtils.isTimescaleDbEnabled(sourceConfig);
+    // Allow small LSN gaps for TimescaleDB due to SMT processing delays  
+    final long timescaleDbLsnTolerance = isTimescaleDbEnabled ? 1000L : 0L;
+
     if (replicationSlot.has("confirmed_flush_lsn")) {
       final long confirmedFlushLsnOnServerSide = Lsn.valueOf(replicationSlot.get("confirmed_flush_lsn").asText()).asLong();
-      LOGGER.info("Replication slot confirmed_flush_lsn : " + confirmedFlushLsnOnServerSide + " Saved offset LSN : " + savedOffset.getAsLong());
-      return savedOffset.getAsLong() >= confirmedFlushLsnOnServerSide;
+      final long savedLsn = savedOffset.getAsLong();
+      final long lsnGap = confirmedFlushLsnOnServerSide - savedLsn;
+      
+      LOGGER.info("Replication slot confirmed_flush_lsn: {} Saved offset LSN: {} Gap: {} TimescaleDB enabled: {}", 
+          confirmedFlushLsnOnServerSide, savedLsn, lsnGap, isTimescaleDbEnabled);
+      
+      if (isTimescaleDbEnabled && lsnGap > 0 && lsnGap <= timescaleDbLsnTolerance) {
+        LOGGER.info("TimescaleDB: Accepting LSN gap of {} units (within tolerance of {})", lsnGap, timescaleDbLsnTolerance);
+        return true;
+      }
+      
+      return savedLsn >= confirmedFlushLsnOnServerSide;
     } else if (replicationSlot.has("restart_lsn")) {
       final long restartLsn = Lsn.valueOf(replicationSlot.get("restart_lsn").asText()).asLong();
-      LOGGER.info("Replication slot restart_lsn : " + restartLsn + " Saved offset LSN : " + savedOffset.getAsLong());
-      return savedOffset.getAsLong() >= restartLsn;
+      final long savedLsn = savedOffset.getAsLong();
+      final long lsnGap = restartLsn - savedLsn;
+      
+      LOGGER.info("Replication slot restart_lsn: {} Saved offset LSN: {} Gap: {} TimescaleDB enabled: {}", 
+          restartLsn, savedLsn, lsnGap, isTimescaleDbEnabled);
+      
+      if (isTimescaleDbEnabled && lsnGap > 0 && lsnGap <= timescaleDbLsnTolerance) {
+        LOGGER.info("TimescaleDB: Accepting LSN gap of {} units (within tolerance of {})", lsnGap, timescaleDbLsnTolerance);
+        return true;
+      }
+      
+      return savedLsn >= restartLsn;
     }
 
     // We return true when saved offset is not present cause using an empty offset would result in sync

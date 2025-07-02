@@ -313,6 +313,37 @@
                 "min": 4,
                 "max": 24,
                 "order": 10
+              },
+              "enable_timescaledb_support": {
+                "type": "boolean",
+                "title": "Enable TimescaleDB Support",
+                "description": "Enable support for TimescaleDB hypertables and continuous aggregates. When enabled, the connector will automatically include the _timescaledb_internal schema and configure the TimescaleDB SMT for proper message routing. IMPORTANT: Your publication must include ALL TABLES or explicitly include _timescaledb_internal schema.",
+                "default": false,
+                "order": 11
+              },
+              "timescaledb_transforms": {
+                "type": "object",
+                "title": "TimescaleDB Transform Configuration",
+                "description": "Advanced configuration for TimescaleDB Single Message Transform (SMT)",
+                "properties": {
+                  "auto_detect_hypertables": {
+                    "type": "boolean",
+                    "title": "Auto-detect Hypertables",
+                    "description": "Automatically detect and configure hypertables in the database",
+                    "default": true
+                  },
+                  "hide_chunk_tables": {
+                    "type": "boolean",
+                    "title": "Hide Internal Chunk Tables",
+                    "description": "Hide TimescaleDB internal chunk tables from the catalog. Users should only interact with logical hypertables.",
+                    "default": true
+                  }
+                },
+                "condition": {
+                  "property": "enable_timescaledb_support",
+                  "const": true
+                },
+                "order": 12
               }
             }
           },

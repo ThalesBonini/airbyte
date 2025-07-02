@@ -97,6 +97,7 @@ import io.airbyte.integrations.source.postgres.internal.models.XminStatus;
 import io.airbyte.integrations.source.postgres.xmin.PostgresXminHandler;
 import io.airbyte.integrations.source.postgres.xmin.XminCtidUtils.XminStreams;
 import io.airbyte.integrations.source.postgres.xmin.XminStateManager;
+import io.airbyte.integrations.source.postgres.TimescaleDbUtils;
 import io.airbyte.protocol.models.CommonField;
 import io.airbyte.protocol.models.v0.AirbyteCatalog;
 import io.airbyte.protocol.models.v0.AirbyteConnectionStatus;
@@ -124,6 +125,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -164,6 +166,7 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
       PREPARE_THRESHOLD, "0", TCP_KEEP_ALIVE, "true");
 
   private List<String> schemas;
+  private JsonNode sourceConfig;
 
   private Set<AirbyteStreamNameNamespacePair> publicizedTablesInCdc;
   private static final Set<String> INVALID_CDC_SSL_MODES = ImmutableSet.of("allow", "prefer");
@@ -275,7 +278,17 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
 
   @Override
   public Set<String> getExcludedInternalNameSpaces() {
-    return Set.of("information_schema", "pg_catalog", "pg_internal", "catalog_history");
+    final Set<String> excludedSchemas = new HashSet<>(Set.of("information_schema", "pg_catalog", "pg_internal", "catalog_history"));
+    
+    // Only exclude _timescaledb_internal if TimescaleDB support is not enabled
+    // When TimescaleDB support is enabled, we need to discover chunk tables from this schema
+    if (sourceConfig == null || !TimescaleDbUtils.isTimescaleDbEnabled(sourceConfig)) {
+      excludedSchemas.add("_timescaledb_internal");
+    } else {
+      LOGGER.debug("Including _timescaledb_internal schema for TimescaleDB hypertables support");
+    }
+    
+    return excludedSchemas;
   }
 
   @Override
@@ -345,6 +358,9 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
 
   @Override
   public JdbcDatabase createDatabase(final JsonNode sourceConfig) throws SQLException {
+    // Store source config for use in schema exclusion logic
+    this.sourceConfig = sourceConfig;
+    
     final JsonNode jdbcConfig = toDatabaseConfig(sourceConfig);
     final Map<String, String> connectionProperties = getConnectionProperties(sourceConfig);
     // Create the data source
@@ -404,7 +420,15 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
 
   @Override
   public List<TableInfo<CommonField<PostgresType>>> discoverInternal(final JdbcDatabase database) throws Exception {
-    return discoverRawTables(database);
+    // Get the raw tables including TimescaleDB internal tables if enabled
+    final List<TableInfo<CommonField<PostgresType>>> rawTables = discoverRawTables(database);
+    
+    // Filter TimescaleDB internal tables based on configuration
+    if (TimescaleDbUtils.isTimescaleDbEnabled(database.getSourceConfig())) {
+      return filterTimescaleDbTables(database, rawTables);
+    }
+    
+    return rawTables;
   }
 
   public List<TableInfo<CommonField<PostgresType>>> discoverRawTables(final JdbcDatabase database) throws Exception {
@@ -495,6 +519,11 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
         // Empty try statement as we only need to verify that the connection can be created.
         try (final Connection connection = PostgresReplicationConnection.createConnection(databaseConfig)) {}
       });
+    }
+
+    // TimescaleDB-specific validation when TimescaleDB support is enabled
+    if (TimescaleDbUtils.isTimescaleDbEnabled(config)) {
+      checkOperations.add(database -> validateTimescaleDbConfiguration(database, config));
     }
 
     if (isXmin(config)) {
@@ -1025,6 +1054,124 @@ public class PostgresSource extends AbstractJdbcSource<PostgresType> implements 
 
   private boolean cloudDeploymentMode() {
     return AdaptiveSourceRunner.CLOUD_MODE.equalsIgnoreCase(getFeatureFlags().deploymentMode());
+  }
+
+  /**
+   * Validate TimescaleDB configuration and setup.
+   * This method performs comprehensive validation when TimescaleDB support is enabled.
+   *
+   * @param database The JDBC database connection
+   * @param config The source configuration
+   * @throws ConfigErrorException if TimescaleDB configuration is invalid
+   * @throws SQLException if database queries fail
+   */
+  private void validateTimescaleDbConfiguration(final JdbcDatabase database, final JsonNode config) throws SQLException {
+    LOGGER.info("Validating TimescaleDB configuration...");
+
+    // 1. Verify TimescaleDB extension is present
+    if (!TimescaleDbUtils.isTimescaleDbExtensionPresent(database)) {
+      throw new ConfigErrorException(
+          "TimescaleDB support is enabled but TimescaleDB extension is not installed on the database. " +
+          "Please install TimescaleDB extension or disable TimescaleDB support in the connector configuration.");
+    }
+
+    final String timescaleVersion = TimescaleDbUtils.getTimescaleDbVersion(database);
+    LOGGER.info("TimescaleDB extension detected, version: {}", timescaleVersion);
+
+    // 1.1. Check version compatibility
+    TimescaleDbUtils.checkTimescaleDbVersionCompatibility(database);
+
+    // 1.2. Validate information views accessibility
+    if (!TimescaleDbUtils.validateTimescaleDbInformationViews(database)) {
+      throw new ConfigErrorException(
+          "TimescaleDB information views are not accessible. This may indicate:\n" +
+          "  - TimescaleDB extension is not properly installed\n" +
+          "  - Database user lacks permissions to access TimescaleDB metadata\n" +
+          "  - TimescaleDB version compatibility issues\n" +
+          "Please ensure proper TimescaleDB installation and user permissions.");
+    }
+
+    // 2. Validate publication configuration for CDC mode
+    if (isCdc(config)) {
+      final String publicationName = config.get("replication_method").get("publication").asText();
+      try {
+        TimescaleDbUtils.validatePublication(database, publicationName);
+        LOGGER.info("Publication '{}' is correctly configured for TimescaleDB", publicationName);
+      } catch (final ConfigErrorException e) {
+        // Re-throw with enhanced error message
+        throw new ConfigErrorException(
+            e.getMessage() + "\n\n" +
+            "IMPORTANT: For TimescaleDB hypertables to work correctly with CDC, your publication must include chunk tables. " +
+            "You can fix this by running one of these commands:\n" +
+            "  Option 1 (Recommended): ALTER PUBLICATION " + publicationName + " SET (publish = 'insert, update, delete', publish_via_partition_root = false);\n" +
+            "                          ALTER PUBLICATION " + publicationName + " ADD ALL TABLES IN SCHEMA _timescaledb_internal;\n" +
+            "  Option 2 (Alternative): DROP PUBLICATION " + publicationName + "; CREATE PUBLICATION " + publicationName + " FOR ALL TABLES;");
+      }
+    }
+
+    // 3. Check permissions on _timescaledb_internal schema
+    try {
+      final List<JsonNode> schemaCheck = database.queryJsons(
+          "SELECT 1 FROM information_schema.schemata WHERE schema_name = '_timescaledb_internal'");
+      if (schemaCheck.isEmpty()) {
+        LOGGER.warn("_timescaledb_internal schema not found. This might indicate an issue with TimescaleDB installation.");
+      }
+    } catch (final SQLException e) {
+      LOGGER.warn("Could not check _timescaledb_internal schema existence: {}", e.getMessage());
+    }
+
+    // 4. Verify at least one hypertable exists (warning only)
+    try {
+      final List<String> hypertables = TimescaleDbUtils.getHypertables(database, "public");
+      if (hypertables.isEmpty()) {
+        LOGGER.warn("No hypertables found in 'public' schema. TimescaleDB support is enabled but no hypertables were detected. " +
+                   "This configuration will work but may not be necessary if you're not using hypertables.");
+      } else {
+        LOGGER.info("Found {} hypertables in 'public' schema: {}", hypertables.size(), hypertables);
+      }
+    } catch (final SQLException e) {
+      LOGGER.warn("Could not check for hypertables in 'public' schema: {}", e.getMessage());
+    }
+
+    // 5. Log additional configuration information
+    if (TimescaleDbUtils.shouldHideChunkTables(config)) {
+      LOGGER.info("TimescaleDB chunk tables will be hidden from user catalog");
+    }
+    if (TimescaleDbUtils.shouldAutoDetectHypertables(config)) {
+      LOGGER.info("TimescaleDB hypertables will be auto-detected");
+    }
+
+    LOGGER.info("TimescaleDB configuration validation completed successfully");
+  }
+
+  /**
+   * Filter TimescaleDB internal tables from the discovered table list.
+   * This method hides chunk tables and other internal TimescaleDB tables from users
+   * while still allowing them to be captured by CDC for the SMT to process.
+   *
+   * @param database The JDBC database connection
+   * @param rawTables The list of all discovered tables
+   * @return Filtered list of tables that should be exposed to users
+   */
+  private List<TableInfo<CommonField<PostgresType>>> filterTimescaleDbTables(final JdbcDatabase database, 
+                                                                            final List<TableInfo<CommonField<PostgresType>>> rawTables) throws SQLException {
+    final List<TableInfo<CommonField<PostgresType>>> filteredTables = new ArrayList<>();
+    
+    for (final TableInfo<CommonField<PostgresType>> table : rawTables) {
+      final String schemaName = table.getNameSpace();
+      final String tableName = table.getName();
+      
+      // Apply TimescaleDB table filtering
+      if (TimescaleDbUtils.shouldExposeTableToUser(database, schemaName, tableName)) {
+        filteredTables.add(table);
+        LOGGER.debug("Including table for user catalog: {}.{}", schemaName, tableName);
+      } else {
+        LOGGER.debug("Hiding TimescaleDB internal table from user catalog: {}.{}", schemaName, tableName);
+      }
+    }
+    
+    LOGGER.info("Filtered {} tables, exposing {} tables to user catalog", rawTables.size(), filteredTables.size());
+    return filteredTables;
   }
 
 }

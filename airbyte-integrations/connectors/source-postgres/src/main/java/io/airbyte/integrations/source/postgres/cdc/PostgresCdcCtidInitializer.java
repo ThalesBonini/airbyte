@@ -14,14 +14,20 @@ import static io.airbyte.integrations.source.postgres.PostgresSpecConstants.RESY
 import static io.airbyte.integrations.source.postgres.PostgresUtils.isDebugMode;
 import static io.airbyte.integrations.source.postgres.PostgresUtils.prettyPrintConfiguredAirbyteStreamList;
 import static io.airbyte.integrations.source.postgres.ctid.CtidUtils.createInitialLoader;
+import static io.airbyte.integrations.source.postgres.PostgresUtils.isCdc;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.airbyte.cdk.db.jdbc.JdbcDatabase;
 import io.airbyte.cdk.db.jdbc.JdbcUtils;
 import io.airbyte.cdk.integrations.base.AirbyteTraceMessageUtility;
 import io.airbyte.cdk.integrations.debezium.AirbyteDebeziumHandler;
+import io.airbyte.cdk.integrations.debezium.internals.DebeziumEventConverter;
 import io.airbyte.cdk.integrations.debezium.internals.RelationalDbDebeziumEventConverter;
 import io.airbyte.cdk.integrations.debezium.internals.RelationalDbDebeziumPropertiesManager;
+import io.airbyte.cdk.integrations.debezium.internals.DebeziumPropertiesManager;
+import java.sql.Array;
+import java.sql.SQLException;
+import java.util.stream.Collectors;
 import io.airbyte.cdk.integrations.source.relationaldb.InitialLoadTimeoutUtil;
 import io.airbyte.cdk.integrations.source.relationaldb.TableInfo;
 import io.airbyte.cdk.integrations.source.relationaldb.models.CdcState;
@@ -36,12 +42,14 @@ import io.airbyte.commons.util.AutoCloseableIterators;
 import io.airbyte.integrations.source.postgres.PostgresQueryUtils;
 import io.airbyte.integrations.source.postgres.PostgresType;
 import io.airbyte.integrations.source.postgres.PostgresUtils;
+import io.airbyte.integrations.source.postgres.TimescaleDbUtils;
 import io.airbyte.integrations.source.postgres.cdc.PostgresCdcCtidUtils.CtidStreams;
 import io.airbyte.integrations.source.postgres.ctid.CtidGlobalStateManager;
 import io.airbyte.integrations.source.postgres.ctid.FileNodeHandler;
 import io.airbyte.integrations.source.postgres.ctid.PostgresCtidHandler;
 import io.airbyte.protocol.models.CommonField;
 import io.airbyte.protocol.models.v0.AirbyteMessage;
+import io.airbyte.protocol.models.v0.AirbyteStream;
 import io.airbyte.protocol.models.v0.AirbyteStreamNameNamespacePair;
 import io.airbyte.protocol.models.v0.AirbyteStreamStatusTraceMessage;
 import io.airbyte.protocol.models.v0.ConfiguredAirbyteCatalog;
@@ -62,6 +70,10 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import io.airbyte.integrations.source.postgres.cdc.PostgresCdcConnectorMetadataInjector;
+import java.util.Properties;
+import io.airbyte.cdk.integrations.debezium.internals.AirbyteFileOffsetBackingStore;
+import io.airbyte.cdk.integrations.debezium.internals.AirbyteSchemaHistoryStorage;
 
 public class PostgresCdcCtidInitializer {
 
@@ -91,7 +103,8 @@ public class PostgresCdcCtidInitializer {
         // we run all the check operations and one of the check validates that the replication slot exists
         // and has only 1 entry
         replicationSlot,
-        savedOffset);
+        savedOffset,
+        database.getSourceConfig());
   }
 
   public static CtidGlobalStateManager getCtidInitialLoadGlobalStateManager(final JdbcDatabase database,
@@ -269,7 +282,15 @@ public class PostgresCdcCtidInitializer {
         .filter(stream -> isStreamPartiallyOrFullyCompleted(stream, finalListOfStreamsToBeSyncedViaCtid, ctidStreams))
         .map(stream -> stream.getStream().getNamespace() + "." + stream.getStream().getName()).toList();
 
-    final var eventConverter = new RelationalDbDebeziumEventConverter(new PostgresCdcConnectorMetadataInjector(), emittedAt);
+    // Create TimescaleDB-aware event converter if TimescaleDB support is enabled
+    final RelationalDbDebeziumEventConverter baseEventConverter = new RelationalDbDebeziumEventConverter(new PostgresCdcConnectorMetadataInjector(), emittedAt);
+    final DebeziumEventConverter eventConverter = TimescaleDbUtils.isTimescaleDbEnabled(sourceConfig) 
+        ? new TimescaleDbEventConverter(baseEventConverter, sourceConfig)
+        : baseEventConverter;
+    
+    if (TimescaleDbUtils.isTimescaleDbEnabled(sourceConfig)) {
+      LOGGER.info("Using TimescaleDB-aware event converter for SMT message routing");
+    }
 
     final List<AutoCloseableIterator<AirbyteMessage>> cdcStreamsStartStatusEmitters = catalog.getStreams().stream()
         .filter(stream -> stream.getSyncMode() == SyncMode.INCREMENTAL)
@@ -296,9 +317,8 @@ public class PostgresCdcCtidInitializer {
        * with ALL of the incremental streams configured. This is because if step 1 completes, the initial
        * load can be considered finished.
        */
-      final var propertiesManager = new RelationalDbDebeziumPropertiesManager(
-          PostgresCdcProperties.getDebeziumDefaultProperties(database), sourceConfig, catalog, allCdcStreamList);
-      final Supplier<AutoCloseableIterator<AirbyteMessage>> incrementalIteratorsSupplier = getCdcIncrementalIteratorsSupplier(handler,
+      final var propertiesManager = createTimescaleDbEnhancedPropertiesManager(database, sourceConfig, catalog, allCdcStreamList);
+      final Supplier<AutoCloseableIterator<AirbyteMessage>> incrementalIteratorsSupplier = createIncrementalIteratorsSupplier(handler,
           propertiesManager, eventConverter, stateToBeUsed, postgresCdcStateHandler);
       return Collections.singletonList(
           AutoCloseableIterators.concatWithEagerClose(
@@ -318,9 +338,8 @@ public class PostgresCdcCtidInitializer {
        * should be run in the following order: 1. Run the debezium iterators with ALL of the incremental
        * streams configured.
        */
-      final var propertiesManager = new RelationalDbDebeziumPropertiesManager(
-          PostgresCdcProperties.getDebeziumDefaultProperties(database), sourceConfig, catalog, allCdcStreamList);
-      final Supplier<AutoCloseableIterator<AirbyteMessage>> incrementalIteratorSupplier = getCdcIncrementalIteratorsSupplier(handler,
+      final var propertiesManager = createTimescaleDbEnhancedPropertiesManager(database, sourceConfig, catalog, allCdcStreamList);
+      final Supplier<AutoCloseableIterator<AirbyteMessage>> incrementalIteratorSupplier = createIncrementalIteratorsSupplier(handler,
           propertiesManager, eventConverter, stateToBeUsed, postgresCdcStateHandler);
       return Stream.of(cdcStreamsStartStatusEmitters, Collections.singletonList(incrementalIteratorSupplier.get()), cdcStreamsCompleteStatusEmitters)
           .flatMap(Collection::stream)
@@ -335,9 +354,8 @@ public class PostgresCdcCtidInitializer {
        * (> 8hrs by default).
        */
       AirbyteTraceMessageUtility.emitAnalyticsTrace(wassOccurrenceMessage());
-      final var propertiesManager = new RelationalDbDebeziumPropertiesManager(
-          PostgresCdcProperties.getDebeziumDefaultProperties(database), sourceConfig, catalog, startedCdcStreamList);
-      final Supplier<AutoCloseableIterator<AirbyteMessage>> incrementalIteratorSupplier = getCdcIncrementalIteratorsSupplier(handler,
+      final var propertiesManager = createTimescaleDbEnhancedPropertiesManager(database, sourceConfig, catalog, startedCdcStreamList);
+      final Supplier<AutoCloseableIterator<AirbyteMessage>> incrementalIteratorSupplier = createIncrementalIteratorsSupplier(handler,
           propertiesManager, eventConverter, stateToBeUsed, postgresCdcStateHandler);
       return Collections.singletonList(
           AutoCloseableIterators.concatWithEagerClose(
@@ -377,14 +395,361 @@ public class PostgresCdcCtidInitializer {
     return isStreamCompleted || isStreamPartiallyCompleted;
   }
 
+  /**
+   * 🎯 NEW ELEGANT APPROACH: Enhance catalog and completedStreamNames with TimescaleDB chunk tables
+   * This works by adding synthetic ConfiguredAirbyteStream entries for chunk tables to the catalog,
+   * and adding chunk table names to completedStreamNames. The existing getTableIncludelist() logic
+   * naturally produces the enhanced table.include.list without any complex inheritance workarounds.
+   */
+  private static RelationalDbDebeziumPropertiesManager createTimescaleDbEnhancedPropertiesManager(
+      JdbcDatabase database, JsonNode sourceConfig, ConfiguredAirbyteCatalog catalog, List<String> completedStreamNames) {
+    
+    if (!TimescaleDbUtils.isTimescaleDbEnabled(sourceConfig)) {
+      // No TimescaleDB - use standard manager
+      return new RelationalDbDebeziumPropertiesManager(
+          PostgresCdcProperties.getDebeziumDefaultProperties(database), 
+          sourceConfig, 
+          catalog, 
+          completedStreamNames);
+    }
+    
+    LOGGER.info("Enhancing catalog and stream names with TimescaleDB chunk tables for CDC");
+    
+    try {
+      // Discover chunk tables for hypertables in the catalog
+      List<String> chunkTableNames = discoverChunkTablesForCatalog(database, catalog, completedStreamNames);
+      
+      if (chunkTableNames.isEmpty()) {
+        LOGGER.warn("No chunk tables found for TimescaleDB hypertables - using standard manager");
+        return new RelationalDbDebeziumPropertiesManager(
+            PostgresCdcProperties.getDebeziumDefaultProperties(database), 
+            sourceConfig, 
+            catalog, 
+            completedStreamNames);
+      }
+      
+      // ✨ ELEGANT SOLUTION: Enhance the inputs instead of intercepting outputs
+      ConfiguredAirbyteCatalog enhancedCatalog = enhanceCatalogWithChunkTables(catalog, chunkTableNames);
+      List<String> enhancedStreamNames = enhanceStreamNamesWithChunkTables(completedStreamNames, chunkTableNames);
+      
+      LOGGER.info("Enhanced catalog with {} chunk tables for TimescaleDB CDC", chunkTableNames.size());
+      LOGGER.debug("Chunk tables added: {}", chunkTableNames);
+      
+      // Create properties manager with enhanced inputs - existing logic naturally produces enhanced table.include.list
+      return new RelationalDbDebeziumPropertiesManager(
+          PostgresCdcProperties.getDebeziumDefaultProperties(database), 
+          sourceConfig, 
+          enhancedCatalog, 
+          enhancedStreamNames);
+      
+    } catch (Exception e) {
+      LOGGER.error("Failed to discover TimescaleDB chunk tables: {}", e.getMessage(), e);
+      // Fall back to standard manager
+      return new RelationalDbDebeziumPropertiesManager(
+          PostgresCdcProperties.getDebeziumDefaultProperties(database), 
+          sourceConfig, 
+          catalog, 
+          completedStreamNames);
+    }
+  }
+
+  /**
+   * Enhances the catalog by adding synthetic ConfiguredAirbyteStream entries for chunk tables.
+   * These entries will be processed by getTableIncludelist() to naturally include chunk tables.
+   */
+  private static ConfiguredAirbyteCatalog enhanceCatalogWithChunkTables(
+      ConfiguredAirbyteCatalog originalCatalog, 
+      List<String> chunkTableNames) {
+    
+    List<ConfiguredAirbyteStream> enhancedStreams = new ArrayList<>(originalCatalog.getStreams());
+    
+    for (String chunkTableName : chunkTableNames) {
+      // Parse "_timescaledb_internal._hyper_1_2_chunk" 
+      String[] parts = chunkTableName.split("\\.", 2); // Split into max 2 parts
+      if (parts.length != 2) {
+        LOGGER.warn("Invalid chunk table name format: {}, skipping", chunkTableName);
+        continue;
+      }
+      
+      String namespace = parts[0];  // "_timescaledb_internal"
+      String name = parts[1];       // "_hyper_1_2_chunk"
+      
+      // Create synthetic stream entry that will pass getTableIncludelist() filters
+      // ✅ FIX: Add minimal jsonSchema to prevent NPE in getColumnIncludeList()
+      JsonNode minimalSchema = Jsons.jsonNode(java.util.Map.of(
+          "type", "object",
+          "properties", java.util.Map.of()  // Empty properties - Debezium will discover actual columns
+      ));
+      
+      ConfiguredAirbyteStream chunkStream = new ConfiguredAirbyteStream()
+          .withSyncMode(SyncMode.INCREMENTAL)  // ✅ Passes .filter { s.syncMode == SyncMode.INCREMENTAL }
+          .withStream(new AirbyteStream()
+              .withNamespace(namespace)        // ✅ Creates "namespace.name" format
+              .withName(name)                  // ✅ Actual chunk name
+              .withJsonSchema(minimalSchema)); // ✅ Prevents NPE in getColumnIncludeList()
+      
+      enhancedStreams.add(chunkStream);
+      LOGGER.debug("Added synthetic stream for chunk table: {}.{}", namespace, name);
+    }
+    
+    return new ConfiguredAirbyteCatalog().withStreams(enhancedStreams);
+  }
+
+  /**
+   * Enhances completedStreamNames by adding chunk table names.
+   * These will pass the .filter { completedStreamNames.contains(streamName) } check.
+   */
+  private static List<String> enhanceStreamNamesWithChunkTables(
+      List<String> originalStreamNames, 
+      List<String> chunkTableNames) {
+    
+    List<String> enhancedNames = new ArrayList<>(originalStreamNames);
+    enhancedNames.addAll(chunkTableNames);  // Add "_timescaledb_internal._hyper_1_2_chunk"
+    
+    LOGGER.debug("Enhanced stream names from {} to {} entries", originalStreamNames.size(), enhancedNames.size());
+    return enhancedNames;
+  }
+
+  /*
+   * ========================================================================
+   * VESTIGIAL CODE - COMMENTED OUT (Complex inheritance workarounds)
+   * ========================================================================
+   * The following code was our previous complex approach using inheritance,
+   * delegation, and property post-processing. It's now replaced by the simple
+   * catalog enhancement approach above. Keeping commented for reference.
+   */
+
+  /*
+   * OLD COMPLEX APPROACH - Creates a TimescaleDB-aware properties manager that includes 
+   * actual chunk table names in the table include list using complex inheritance workarounds.
+   */
+  /*
+  private static RelationalDbDebeziumPropertiesManager createTimescaleDbAwarePropertiesManager(
+      JdbcDatabase database, JsonNode sourceConfig, ConfiguredAirbyteCatalog catalog, List<String> completedStreamNames) {
+    
+    // Create the standard properties manager
+    Properties baseProperties = PostgresCdcProperties.getDebeziumDefaultProperties(database);
+    RelationalDbDebeziumPropertiesManager standardManager = 
+        new RelationalDbDebeziumPropertiesManager(baseProperties, sourceConfig, catalog, completedStreamNames);
+    
+    // For TimescaleDB, discover chunk tables and store enhancement info for later use
+    if (TimescaleDbUtils.isTimescaleDbEnabled(sourceConfig)) {
+      LOGGER.info("Preparing TimescaleDB chunk table discovery for CDC enhancement");
+      
+      try {
+        // Get the original table include list that would be generated
+        String originalTableList = RelationalDbDebeziumPropertiesManager.Companion.getTableIncludelist(catalog, completedStreamNames);
+        LOGGER.info("Original table include list: {}", originalTableList);
+        
+        if (!originalTableList.isEmpty()) {
+          // Discover chunk tables for hypertables in the catalog
+          List<String> chunkTableNames = discoverChunkTablesForCatalog(database, catalog, completedStreamNames);
+          
+          if (!chunkTableNames.isEmpty()) {
+            // Format chunk table names with proper escaping
+            String chunkTablesFormatted = chunkTableNames.stream()
+                .map(chunkName -> "\\Q" + chunkName + "\\E")
+                .collect(Collectors.joining(","));
+            
+            // Create enhanced table list
+            String enhancedTableList = originalTableList + "," + chunkTablesFormatted;
+            
+            LOGGER.info("Enhanced table include list for TimescaleDB with {} chunk tables: {}", 
+                       chunkTableNames.size(), enhancedTableList);
+            
+            // Store the enhanced table list in base properties for later use
+            baseProperties.setProperty("_airbyte_timescaledb_enhanced_table_list", enhancedTableList);
+          } else {
+            LOGGER.warn("No chunk tables found for TimescaleDB hypertables");
+          }
+        } else {
+          LOGGER.warn("No original table include list found");
+        }
+      } catch (Exception e) {
+        LOGGER.error("Failed to discover TimescaleDB chunk tables: {}", e.getMessage(), e);
+      }
+    }
+    
+    // Return standard properties manager with enhancement data stored in properties
+    return standardManager;
+  }
+  */
+
+  /*
+   * VESTIGIAL CODE - OLD COMPLEX SUPPLIER WITH WRAPPER CLASSES
+   * This is replaced by direct call to handler.getIncrementalIterators()
+   */
+  /*
   @SuppressWarnings("unchecked")
   private static Supplier<AutoCloseableIterator<AirbyteMessage>> getCdcIncrementalIteratorsSupplier(AirbyteDebeziumHandler handler,
                                                                                                     RelationalDbDebeziumPropertiesManager propertiesManager,
-                                                                                                    RelationalDbDebeziumEventConverter eventConverter,
+                                                                                                    DebeziumEventConverter eventConverter,
                                                                                                     CdcState stateToBeUsed,
                                                                                                     PostgresCdcStateHandler postgresCdcStateHandler) {
-    return () -> handler.getIncrementalIterators(
-        propertiesManager, eventConverter, new PostgresCdcSavedInfoFetcher(stateToBeUsed), postgresCdcStateHandler);
+    return () -> {
+      // Create enhanced handler for TimescaleDB if needed
+      TimescaleDbAwareDebeziumHandler enhancedHandler = new TimescaleDbAwareDebeziumHandler(handler);
+      
+      return enhancedHandler.getIncrementalIterators(
+          propertiesManager, eventConverter, new PostgresCdcSavedInfoFetcher(stateToBeUsed), postgresCdcStateHandler);
+    };
+  }
+  */
+
+  /**
+   * 🎯 NEW SIMPLE APPROACH: Create incremental iterators supplier without complex wrappers
+   */
+  @SuppressWarnings("unchecked")
+  private static Supplier<AutoCloseableIterator<AirbyteMessage>> createIncrementalIteratorsSupplier(AirbyteDebeziumHandler handler,
+                                                                                                    RelationalDbDebeziumPropertiesManager propertiesManager,
+                                                                                                    DebeziumEventConverter eventConverter,
+                                                                                                    CdcState stateToBeUsed,
+                                                                                                    PostgresCdcStateHandler postgresCdcStateHandler) {
+    return () -> {
+      // Direct call - no complex wrappers needed since catalog enhancement handles everything
+      return handler.getIncrementalIterators(
+          propertiesManager, eventConverter, new PostgresCdcSavedInfoFetcher(stateToBeUsed), postgresCdcStateHandler);
+    };
+  }
+
+    /*
+   * ========================================================================
+   * VESTIGIAL CODE - COMPLEX WRAPPER CLASSES (Commented out)
+   * ========================================================================
+   * The following classes were our complex inheritance workaround approach.
+   * They are no longer needed with the catalog enhancement solution.
+   */
+
+  /*
+   * OLD WRAPPER CLASS - Wrapper for AirbyteDebeziumHandler that enhances properties 
+   * for TimescaleDB before calling the original handler.
+   */
+  /*
+  private static class TimescaleDbAwareDebeziumHandler {
+    private final AirbyteDebeziumHandler delegate;
+    
+    public TimescaleDbAwareDebeziumHandler(AirbyteDebeziumHandler delegate) {
+      this.delegate = delegate;
+    }
+    
+    public AutoCloseableIterator<AirbyteMessage> getIncrementalIterators(
+        RelationalDbDebeziumPropertiesManager propertiesManager,
+        DebeziumEventConverter eventConverter,
+        PostgresCdcSavedInfoFetcher savedInfoFetcher,
+        PostgresCdcStateHandler stateHandler) {
+      
+      // Create a wrapper that enhances properties when requested
+      TimescaleDbPropertiesManagerDelegate enhancedManager = new TimescaleDbPropertiesManagerDelegate(propertiesManager);
+      
+      // Call the original handler with the enhanced manager
+      return delegate.getIncrementalIterators(enhancedManager, eventConverter, savedInfoFetcher, stateHandler);
+    }
+  }
+  */
+
+  /*
+   * OLD DELEGATE CLASS - Delegate that enhances getDebeziumProperties calls for TimescaleDB 
+   * without extending the final class.
+   */
+  /*
+  private static class TimescaleDbPropertiesManagerDelegate extends RelationalDbDebeziumPropertiesManager {
+    private final RelationalDbDebeziumPropertiesManager delegate;
+    
+    public TimescaleDbPropertiesManagerDelegate(RelationalDbDebeziumPropertiesManager delegate) {
+      // Required super call with minimal dummy data
+      super(new Properties(), 
+            Jsons.jsonNode(java.util.Map.of("host", "dummy", "port", "5432", "database", "dummy", "username", "dummy")), 
+            new ConfiguredAirbyteCatalog().withStreams(java.util.List.of()), 
+            java.util.List.of());
+      this.delegate = delegate;
+    }
+    
+    @Override
+    public Properties getDebeziumProperties(AirbyteFileOffsetBackingStore offsetManager) {
+      Properties properties = delegate.getDebeziumProperties(offsetManager);
+      return enhancePropertiesForTimescaleDb(properties);
+    }
+
+    @Override
+    public Properties getDebeziumProperties(AirbyteFileOffsetBackingStore offsetManager, 
+                                          Optional<AirbyteSchemaHistoryStorage> schemaHistoryManager) {
+      Properties properties = delegate.getDebeziumProperties(offsetManager, schemaHistoryManager);
+      return enhancePropertiesForTimescaleDb(properties);
+    }
+    
+    private Properties enhancePropertiesForTimescaleDb(Properties originalProperties) {
+      // Check if TimescaleDB enhancement is available
+      String enhancedTableList = originalProperties.getProperty("_airbyte_timescaledb_enhanced_table_list");
+      if (enhancedTableList != null && !enhancedTableList.isEmpty()) {
+        LOGGER.info("Applying TimescaleDB enhanced table include list");
+        originalProperties.setProperty("table.include.list", enhancedTableList);
+        LOGGER.debug("Final table.include.list: {}", enhancedTableList);
+        
+        // Remove the temporary property
+        originalProperties.remove("_airbyte_timescaledb_enhanced_table_list");
+      }
+      
+      return originalProperties;
+    }
+  }
+  */
+
+  /**
+   * Discovers all chunk tables for hypertables that are present in the catalog.
+   * Returns a list of fully qualified chunk table names (schema.table_name).
+   */
+  private static List<String> discoverChunkTablesForCatalog(JdbcDatabase database, ConfiguredAirbyteCatalog catalog, 
+                                                           List<String> completedStreamNames) throws Exception {
+    List<String> chunkTableNames = new ArrayList<>();
+    
+    // Get hypertable names from catalog that are in completed stream names
+    List<String> hypertableNames = catalog.getStreams().stream()
+        .filter(stream -> stream.getSyncMode() == SyncMode.INCREMENTAL)
+        .map(stream -> stream.getStream().getNamespace() + "." + stream.getStream().getName())
+        .filter(streamName -> completedStreamNames.contains(streamName))
+        .map(streamName -> {
+          // Extract just the table name (after the last dot)
+          String[] parts = streamName.split("\\.");
+          return parts[parts.length - 1];
+        })
+        .collect(Collectors.toList());
+    
+    if (hypertableNames.isEmpty()) {
+      LOGGER.info("No hypertables found in completed stream names for chunk discovery");
+      return chunkTableNames;
+    }
+    
+    LOGGER.info("Discovering chunk tables for hypertables: {}", hypertableNames);
+    
+    // Query to get all chunks for each hypertable individually (safer than array approach)
+    String chunkDiscoveryQuery = """
+        SELECT DISTINCT
+            c.chunk_schema || '.' || c.chunk_name as full_chunk_name
+        FROM timescaledb_information.chunks c
+        WHERE c.hypertable_name = ?
+        ORDER BY c.chunk_schema || '.' || c.chunk_name
+        """;
+    
+    // Query each hypertable individually to get its chunks
+    for (String hypertableName : hypertableNames) {
+      try {
+        List<JsonNode> chunkResults = database.queryJsons(chunkDiscoveryQuery, hypertableName);
+        
+        for (JsonNode result : chunkResults) {
+          String chunkName = result.get("full_chunk_name").asText();
+          chunkTableNames.add(chunkName);
+          LOGGER.debug("Found chunk table: {} for hypertable: {}", chunkName, hypertableName);
+        }
+        
+        LOGGER.debug("Found {} chunk tables for hypertable: {}", chunkResults.size(), hypertableName);
+      } catch (SQLException e) {
+        LOGGER.warn("Failed to discover chunks for hypertable '{}': {}", hypertableName, e.getMessage());
+        // Continue with other hypertables even if one fails
+      }
+    }
+    
+    LOGGER.info("Discovered {} total chunk tables for TimescaleDB hypertables", chunkTableNames.size());
+    return chunkTableNames;
   }
 
 }

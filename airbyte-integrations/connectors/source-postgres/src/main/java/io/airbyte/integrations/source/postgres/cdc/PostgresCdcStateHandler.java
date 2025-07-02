@@ -22,9 +22,20 @@ public class PostgresCdcStateHandler implements CdcStateHandler {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(PostgresCdcStateHandler.class);
   private final StateManager stateManager;
+  private final TimescaleDbStateManager timescaleDbStateManager;
 
   public PostgresCdcStateHandler(final StateManager stateManager) {
     this.stateManager = stateManager;
+    this.timescaleDbStateManager = null; // Will be null for non-TimescaleDB configurations
+  }
+
+  public PostgresCdcStateHandler(final StateManager stateManager, final TimescaleDbStateManager timescaleDbStateManager) {
+    this.stateManager = stateManager;
+    this.timescaleDbStateManager = timescaleDbStateManager;
+    
+    if (timescaleDbStateManager != null) {
+      LOGGER.info("PostgresCdcStateHandler initialized with TimescaleDB state management");
+    }
   }
 
   @Override
@@ -36,14 +47,33 @@ public class PostgresCdcStateHandler implements CdcStateHandler {
   public AirbyteMessage saveState(final Map<String, String> offset, final SchemaHistory<String> ignored) {
     final JsonNode asJson = Jsons.jsonNode(offset);
     LOGGER.info("debezium state: {}", asJson);
+    
     final CdcState cdcState = new CdcState().withState(asJson);
     stateManager.getCdcStateManager().setCdcState(cdcState);
+    
     /*
      * Namespace pair is ignored by global state manager, but is needed for satisfy the API contract.
      * Therefore, provide an empty optional.
      */
-    final AirbyteStateMessage stateMessage = stateManager.emit(Optional.empty());
-    return new AirbyteMessage().withType(Type.STATE).withState(stateMessage);
+    final AirbyteStateMessage originalStateMessage = stateManager.emit(Optional.empty());
+    
+    // If TimescaleDB state manager is enabled, process the state message for SMT routing
+    if (timescaleDbStateManager != null) {
+      LOGGER.debug("Processing state message through TimescaleDbStateManager");
+      
+      // We need the current record message to extract SMT headers, but we don't have it here
+      // For now, just validate state consistency and return the original state
+      if (!timescaleDbStateManager.validateStateConsistency()) {
+        LOGGER.warn("TimescaleDB state inconsistency detected during state save");
+        LOGGER.debug("TimescaleDB state summary: {}", timescaleDbStateManager.getStateSummary());
+      }
+      
+      // TODO: In a future enhancement, we could aggregate chunk-level state here
+      // For now, we ensure the original state is preserved
+      return new AirbyteMessage().withType(Type.STATE).withState(originalStateMessage);
+    }
+    
+    return new AirbyteMessage().withType(Type.STATE).withState(originalStateMessage);
   }
 
   /**
@@ -59,12 +89,27 @@ public class PostgresCdcStateHandler implements CdcStateHandler {
   @Override
   public AirbyteMessage saveStateAfterCompletionOfSnapshotOfNewStreams() {
     LOGGER.info("Snapshot of new tables is complete, saving state");
+    
     /*
      * Namespace pair is ignored by global state manager, but is needed for satisfy the API contract.
      * Therefore, provide an empty optional.
      */
     final AirbyteStateMessage stateMessage = stateManager.emit(Optional.empty());
+    
+    // Reset TimescaleDB state when snapshot is complete
+    if (timescaleDbStateManager != null) {
+      LOGGER.info("Resetting TimescaleDB state after snapshot completion");
+      timescaleDbStateManager.resetAllState();
+    }
+    
     return new AirbyteMessage().withType(Type.STATE).withState(stateMessage);
+  }
+
+  /**
+   * Get the TimescaleDB state manager if available.
+   */
+  public Optional<TimescaleDbStateManager> getTimescaleDbStateManager() {
+    return Optional.ofNullable(timescaleDbStateManager);
   }
 
 }
